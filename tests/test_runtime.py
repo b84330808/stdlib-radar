@@ -40,16 +40,16 @@ METHOD_HOMES = {
 def resolve(dotted):
     """Import the longest importable module prefix of dotted and getattr the rest."""
     parts = dotted.split(".")
-    for i in range(len(parts), 0, -1):
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # the APIs warn before they go
+        for i in range(len(parts), 0, -1):
+            try:
                 obj = importlib.import_module(".".join(parts[:i]))
-        except ImportError:
-            continue
-        for attr in parts[i:]:
-            obj = getattr(obj, attr)
-        return obj
+            except ImportError:
+                continue
+            for attr in parts[i:]:
+                obj = getattr(obj, attr)
+            return obj
     raise ImportError(dotted)
 
 

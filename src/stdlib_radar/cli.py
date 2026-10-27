@@ -18,6 +18,7 @@ from .sources import (
     find_default_venv,
     is_test_path,
     load_environment,
+    norm_name,
     site_dirs_for_prefix,
     site_dirs_for_python,
     source_unit,
@@ -191,16 +192,16 @@ def main(argv=None) -> int:
             version = venv_python_version(prefix)
             env = load_environment(dirs, version)
             environment = (f"Python {version}, " if version else "") + str(prefix)
-    paths = args.paths or ([] if (args.venv or args.python) else [Path(".")])
+    paths = args.paths or ([] if (args.venv or args.python or args.dist) else [Path(".")])
     for p in paths:
         if not p.exists():
             parser.error(f"no such file or directory: {p}")
 
     units = []
     if env is not None:
-        wanted = {d.lower().replace("_", "-") for d in args.dist}
+        wanted = {norm_name(d) for d in args.dist}
         for u in env.units:
-            if wanted and u.name.lower().replace("_", "-") not in wanted:
+            if wanted and norm_name(u.name) not in wanted:
                 continue
             include_tests = bool(args.tests)
             u.files = [f for f in u.files if include_tests or not is_test_path(_rel(f, u.root))]

@@ -1,4 +1,5 @@
 import json
+import sys
 import textwrap
 
 import pytest
@@ -87,6 +88,14 @@ def test_dist_filter_and_fail_on(site, capsys):
     assert code == 1
     code, _ = run(capsys, "--venv", site, "--fail-on", "never")
     assert code == 0
+
+
+def test_python_option_scans_that_interpreter(capsys):
+    code, out = run(capsys, "--python", sys.executable, "--dist", "pytest", "--json", "--fail-on", "never")
+    data = json.loads(out)
+    assert code == 0
+    assert data["environment"].startswith(f"Python {sys.version_info[0]}.{sys.version_info[1]}.")
+    assert data["files"] > 50  # pytest's own files, and no source tree
 
 
 def test_text_and_markdown(site, capsys):
