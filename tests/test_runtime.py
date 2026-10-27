@@ -72,8 +72,8 @@ def test_names_exist_until_removed(entry):
             assert not exists(name), f"{name} still exists on {RUNNING}"
         elif name in PLATFORM_ONLY or RUNNING < ADDED_IN.get(name, (3, 0)):
             continue
-        elif sys.platform == "win32" and ("ChildWatcher" in name or "child_watcher" in name):
-            continue  # the watchers were Unix-only
+        elif sys.platform == "win32" and ("ChildWatcher" in name or "unix_events" in name):
+            continue  # the watcher classes were Unix-only
         else:
             assert exists(name), f"{name} missing on {RUNNING}"
 
