@@ -57,8 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--encoding", action="store_true",
                    help="also report text I/O without encoding= (UTF-8 default in 3.15, PEP 686; noisy)")
     p.add_argument("--removed-only", action="store_true", help="skip behaviour changes, report removals only")
-    p.add_argument("--min-confidence", choices=CONFIDENCES, default="low",
-                   help="hide heuristic findings below this confidence (default low: show all)")
+    p.add_argument("--min-confidence", choices=CONFIDENCES, default="medium",
+                   help="hide findings below this confidence (default medium; low adds importlib.metadata.metadata() calls)")
     p.add_argument("--dist", action="append", default=[], metavar="NAME",
                    help="only report these distributions (repeatable)")
     tests = p.add_mutually_exclusive_group()

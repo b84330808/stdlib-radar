@@ -115,6 +115,8 @@ class Analyzer:
         self.class_methods: dict[str, set[str]] = {}
         self.class_bases: dict[str, list[ast.expr]] = {}
         self.group_vars: dict[int, dict[str, str]] = {}
+        self.loaded_attrs: set[str] = set()
+        self.future_annotations = False
         self._prepass()
 
     # ------------------------------------------------------------------ setup
@@ -129,6 +131,8 @@ class Analyzer:
                         root = a.name.split(".")[0]
                         self.bindings.setdefault(root, set()).add(root)
             elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                if node.module == "__future__" and any(a.name == "annotations" for a in node.names):
+                    self.future_annotations = True
                 for a in node.names:
                     if a.name != "*":
                         self.bindings.setdefault(a.asname or a.name, set()).add(f"{node.module}.{a.name}")
@@ -145,6 +149,8 @@ class Analyzer:
                     self.class_bases[node.name] = node.bases
             elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
                 self.assigned_names.add(node.id)
+            elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+                self.loaded_attrs.add(node.attr)
         for stmt in self.tree.body:
             if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
                 if self._versionish(stmt.value):
@@ -181,6 +187,19 @@ class Analyzer:
 
     def in_annotation(self) -> bool:
         return any(field in ("annotation", "returns") for _p, field, _c in self.stack)
+
+    def annotation_guard(self) -> str | None:
+        """None if not in an annotation; '' if the annotation is never evaluated; else a guard."""
+        for i, (parent, field, _child) in enumerate(self.stack):
+            if field in ("annotation", "returns"):
+                local = isinstance(parent, ast.AnnAssign) and any(
+                    isinstance(p, _FUNCS) and f == "body" for p, f, _c in self.stack[:i])
+                if local or self.future_annotations:
+                    return ""  # local variable annotations and PEP 563 annotations are never evaluated
+                if self.ctx.target >= (3, 14):
+                    return "annotation, evaluated only when introspected (3.14+)"
+                return None
+        return None
 
     def enclosing_class(self) -> ast.ClassDef | None:
         for parent, _field, _child in reversed(self.stack):
@@ -364,6 +383,10 @@ class Analyzer:
                         names = [(_call_name(a) or "").split(".")[-1] for a in ce.args]
                         if raises and self._catches(names, raises):
                             return f"suppress({'/'.join(names)})"
+            elif isinstance(parent, ast.ExceptHandler) and field == "body":
+                names = self._handler_names(parent)
+                if "ImportError" in names or "ModuleNotFoundError" in names:
+                    return "fallback in except ImportError"
             elif isinstance(parent, (ast.If, ast.IfExp, ast.While)) and field in ("body", "orelse"):
                 guard = self._branch_guard(parent.test, field == "body", words)
                 if guard:
@@ -391,6 +414,8 @@ class Analyzer:
             return "version check"
         if self._mentions(test, words):
             return "feature check"
+        if any(isinstance(n, ast.Call) and _call_name(n.func) == "hasattr" for n in ast.walk(test)):
+            return "feature check (hasattr branch)"
         return None
 
     # --------------------------------------------------------------- findings
@@ -402,6 +427,10 @@ class Analyzer:
         key = (entry.id, node.lineno, node.col_offset, api)
         if key in self.findings:
             return
+        annotation = self.annotation_guard()
+        if annotation == "":
+            return
+        guard = guard or annotation
         self.findings[key] = Finding(
             rule=entry.id,
             removed_in=entry.removed_in,
@@ -519,20 +548,34 @@ class Analyzer:
                 self.method_hit(e, node, names, is_called, parent[0] if is_called else None)
 
     def method_hit(self, e: Entry, node: ast.Attribute, names: set[str], is_called: bool, call) -> None:
+        if not isinstance(node.ctx, ast.Load):
+            return  # assigning obj.co_lnotab = ... on a stand-in object is not a use
         if e.called and not is_called:
             return
-        if e.min_args:
-            if call is None or any(isinstance(a, ast.Starred) for a in call.args) or len(call.args) < e.min_args:
+        if call is not None:
+            if e.min_args and (any(isinstance(a, ast.Starred) for a in call.args) or len(call.args) < e.min_args):
                 return
+            # A call that does not fit the stdlib signature is some other library's method.
+            if e.max_args is not None and len(call.args) + len(call.keywords) > e.max_args:
+                return
+            if any(k.arg is None or k.arg not in e.allowed_keywords for k in call.keywords):
+                return
+        elif e.min_args:
+            return
         receiver = self.resolve(node.value)
         if receiver:
             if not any(r == o or r.startswith(o + ".") for r in receiver for o in e.owners):
                 return
+        cls = self.enclosing_class()
         if isinstance(node.value, ast.Name) and node.value.id in ("self", "cls"):
-            cls = self.enclosing_class()
             if cls is not None and node.attr in self.class_methods.get(cls.name, ()):
                 return
-        self.report(e, node, f"{_call_name(node.value) or '(...)'}.{node.attr}")
+        guard = None
+        if cls is not None and any(
+                isinstance(n, ast.Call) and _call_name(n.func) in ("hasattr", "getattr")
+                and any(_str_const(a) == node.attr for a in n.args) for n in ast.walk(cls)):
+            guard = f"hasattr(..., {node.attr!r}) check in class {cls.name}"
+        self.report(e, node, f"{_call_name(node.value) or '(...)'}.{node.attr}", guard=guard)
 
     # calls
 
@@ -617,21 +660,33 @@ class Analyzer:
         return any(isinstance(b, ast.Name) and self._class_has(b.id, method, seen)
                    for b in self.class_bases.get(cls_name, ()))
 
+    def _is_ast_visitor(self, cls_name: str, seen=None) -> bool:
+        """The class derives from ast.NodeVisitor/NodeTransformer, directly or via classes in this file."""
+        seen = seen or set()
+        if cls_name in seen:
+            return False
+        seen.add(cls_name)
+        for base in self.class_bases.get(cls_name, ()):
+            if self.resolves_to(base, ("ast.NodeVisitor", "ast.NodeTransformer")):
+                return True
+            if isinstance(base, ast.Name) and self._is_ast_visitor(base.id, seen):
+                return True
+        return False
+
     def visit_class(self, node: ast.ClassDef) -> None:
         methods = {i.name: i for i in node.body if isinstance(i, (ast.FunctionDef, ast.AsyncFunctionDef))}
         base_names = [b for base in node.bases for b in (self.resolve(base) or {_call_name(base) or ""})]
         c = self.checks.get("ast_visit_methods")
-        if c and any(m in methods for m in _AST_VISITS) and not self._class_has(node.name, "visit_Constant"):
-            direct = any(b in ("ast.NodeVisitor", "ast.NodeTransformer") for b in base_names)
-            looks = direct or any(b.endswith(("Visitor", "Transformer")) for b in base_names)
-            if looks:
-                for m in _AST_VISITS:
-                    if m in methods:
-                        self.report(c, methods[m], f"{node.name}.{m}", confidence="high" if direct else "medium")
+        if (c and any(m in methods for m in _AST_VISITS) and not self._class_has(node.name, "visit_Constant")
+                and self._is_ast_visitor(node.name)):
+            for m in _AST_VISITS:
+                if m in methods:
+                    self.report(c, methods[m], f"{node.name}.{m}")
         c = self.checks.get("loader_without_exec_module")
         if c and "load_module" in methods and not self._class_has(node.name, "exec_module"):
+            # A finder with only find_module() has not been called since 3.12; that is not this change.
             loaderish = any(re.search(r"Loader|Importer|Finder", b.split(".")[-1]) for b in base_names)
-            loaderish = loaderish or bool({"find_spec", "find_module", "create_module"} & set(methods))
+            loaderish = loaderish or bool({"find_spec", "create_module"} & set(methods))
             if loaderish:
                 self.report(c, methods["load_module"], f"{node.name}.load_module", severity="call")
         c = self.checks.get("partial_class_attribute")
@@ -639,7 +694,12 @@ class Analyzer:
             for item in node.body:
                 value = item.value if isinstance(item, (ast.Assign, ast.AnnAssign)) else None
                 if isinstance(value, ast.Call) and self.resolves_to(value.func, ("functools.partial",)):
-                    self.report(c, item, f"{node.name}: class attribute = functools.partial(...)")
+                    targets = item.targets if isinstance(item, ast.Assign) else [item.target]
+                    names = [t.id for t in targets if isinstance(t, ast.Name)]
+                    # Only binding through an instance (obj.name) changed; a name used just in the
+                    # class body (e.g. as a decorator) is unaffected.
+                    if any(n in self.loaded_attrs for n in names):
+                        self.report(c, item, f"{node.name}.{names[0]} = functools.partial(...)")
 
     def visit_with(self, node) -> None:
         c = self.checks.get("path_context_manager")

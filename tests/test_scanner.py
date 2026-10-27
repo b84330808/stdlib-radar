@@ -367,8 +367,101 @@ def test_partial_class_attribute():
         class A:
             f = functools.partial(print, 1)
             g = staticmethod(functools.partial(print, 2))
+        A().f()
     """
     assert rules(code) == [("py314-functools-partial-method", 4)]
+
+
+def test_partial_used_only_in_class_body():
+    # matplotlib.dviread: the partial is used as a decorator while the class body runs
+    code = """
+        from functools import partial
+        def _dispatch(table, op): return lambda f: f
+        class Dvi:
+            _dtable = []
+            _dispatch = partial(_dispatch, _dtable)
+            @_dispatch(1)
+            def _set_char(self): pass
+    """
+    assert not scan(code)
+
+
+# --- false positives found on real packages (see README, validation) ------------
+
+def test_fallback_in_except_importerror():
+    # nltk: from html import escape / except ImportError: from cgi import escape
+    f = one("try:\n    from html import escape\nexcept ImportError:\n    from cgi import escape")
+    assert f.guard == "fallback in except ImportError"
+
+
+def test_attribute_assignment_is_not_a_use():
+    # twisted/billiard build stand-in code objects: self.co_lnotab = b""
+    assert not scan("class FakeCode:\n    def __init__(self):\n        self.co_lnotab = b''")
+
+
+def test_hasattr_branch_chain():
+    # cloudpickle: if hasattr(obj, "co_exceptiontable"): ... else: obj.co_lnotab
+    code = """
+        def reduce(obj):
+            if hasattr(obj, "co_exceptiontable"):
+                return obj.co_linetable
+            elif hasattr(obj, "co_nmeta"):
+                return 1
+            else:
+                return obj.co_lnotab
+    """
+    assert one(code).guard == "feature check (hasattr branch)"
+
+
+def test_hasattr_in_class_guards_method():
+    # wandb import_hooks: _load_module is only installed when the loader has load_module
+    code = """
+        class Chained:
+            def __init__(self, loader):
+                self.loader = loader
+                if hasattr(loader, "load_module"):
+                    self.load_module = self._load_module
+            def _load_module(self, fullname):
+                return self.loader.load_module(fullname)
+    """
+    assert one(code).guard == "hasattr(..., 'load_module') check in class Chained"
+
+
+def test_method_with_foreign_signature_not_flagged():
+    # jedi: compiled_subprocess.load_module(dotted_name=..., **kwargs)
+    assert not scan("def f(s, n, **kw):\n    return s.load_module(dotted_name=n, **kw)")
+    assert not scan("def f(p):\n    return p.is_reserved(strict=True)")
+
+
+def test_annotations():
+    # anyio: a local variable annotation is never evaluated
+    assert not scan("import asyncio\ndef f():\n    w: asyncio.AbstractChildWatcher | None = None")
+    assert not scan("from __future__ import annotations\nimport ast\ndef f(n: ast.Num): pass")
+    code = "import ast\ndef f(n: ast.Num): pass"
+    assert one(code).guard == "annotation, evaluated only when introspected (3.14+)"
+
+
+def test_visit_num_needs_an_ast_visitor():
+    # sympy fortran_parser: LFortran's asr.ASTVisitor is not ast.NodeVisitor
+    assert not scan("import ast\nfrom lfortran import asr\nclass V(asr.ASTVisitor):\n    def visit_Num(self, n): pass")
+    code = """
+        import ast
+        class Base(ast.NodeTransformer):
+            pass
+        class V(Base):
+            def visit_Str(self, n): pass
+    """
+    assert rules(code) == [("py314-ast-visit-methods", 6)]
+
+
+def test_finder_with_only_find_module_not_flagged():
+    # wandb.util.ImportMetaHook: find_module() is not called since 3.12, so 3.15 changes nothing
+    code = """
+        class Hook:
+            def find_module(self, fullname, path=None): return self
+            def load_module(self, fullname): pass
+    """
+    assert not scan(code)
 
 
 def test_typeddict_without_fields():

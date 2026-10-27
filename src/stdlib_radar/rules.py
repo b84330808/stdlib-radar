@@ -39,6 +39,8 @@ class Entry:
     owners: tuple[str, ...] = ()
     called: bool = False
     min_args: int = 0
+    max_args: int | None = None
+    allowed_keywords: tuple[str, ...] = ()
     keywords: tuple[str, ...] = ()
     keywords_except: tuple[str, ...] = ()
     any_keyword: bool = False
@@ -51,7 +53,7 @@ class Entry:
         return parse_version(self.removed_in)
 
 
-_TUPLE_FIELDS = ("targets", "owners", "keywords", "keywords_except", "backports")
+_TUPLE_FIELDS = ("targets", "owners", "keywords", "keywords_except", "backports", "allowed_keywords")
 
 
 @lru_cache(maxsize=None)

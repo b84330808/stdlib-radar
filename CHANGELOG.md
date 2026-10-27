@@ -13,3 +13,5 @@ First release.
 - Severity: fails at import, fails on call, or behaviour change. Text, Markdown and JSON output;
   exit code 1 for CI.
 - Opt-in `--encoding` check for PEP 686 (UTF-8 mode by default in 3.15).
+- Validated on a venv with 33 popular packages (162 distributions); the 9 false positives
+  found there are fixed and covered by tests.
