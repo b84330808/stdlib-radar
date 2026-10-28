@@ -115,6 +115,7 @@ class Analyzer:
         self.class_methods: dict[str, set[str]] = {}
         self.class_bases: dict[str, list[ast.expr]] = {}
         self.group_vars: dict[int, dict[str, str]] = {}
+        self.getuser_unguarded: list[tuple[tuple[int, str], int]] = []  # (enclosing block, line)
         self.loaded_attrs: set[str] = set()
         self.future_annotations = False
         self._prepass()
@@ -153,7 +154,7 @@ class Analyzer:
                 self.loaded_attrs.add(node.attr)
         for stmt in self.tree.body:
             if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
-                if self._versionish(stmt.value):
+                if self._versionish(stmt.value) or self._mentions_other_vm(stmt.value):
                     self.version_names[stmt.targets[0].id] = stmt.value
 
     # ------------------------------------------------------------- resolution
@@ -305,10 +306,54 @@ class Analyzer:
                     return base[lo:hi]
         return None
 
+    def _other_vm_test(self, e: ast.AST) -> bool | None:
+        """Value on CPython of a test that is true only on Jython or IronPython, else None.
+
+        ``sys.platform.startswith("java")``, ``sys.platform == "cli"``, ``os.name == "java"``,
+        ``"java" in sys.platform``, ``platform.system() == "Java"``,
+        ``platform.python_implementation() == "Jython"`` and their negations.
+        """
+        def platform_str(node) -> bool:
+            if isinstance(node, ast.Subscript):
+                node = node.value  # sys.platform[:4]
+            return bool(self.resolves_to(node, ("sys.platform",)))
+
+        def other_vm(subject, value: str | None) -> bool:
+            if value is None:
+                return False
+            if platform_str(subject):
+                return value.startswith("java") or value == "cli"
+            if self.resolves_to(subject, ("os.name",)):
+                return value == "java"
+            if isinstance(subject, ast.Call) and not subject.args:
+                if self.resolves_to(subject.func, ("platform.system",)):
+                    return value in ("Java", "cli")
+                if self.resolves_to(subject.func, ("platform.python_implementation",)):
+                    return value in ("Jython", "IronPython")
+            return False
+
+        if (isinstance(e, ast.Call) and isinstance(e.func, ast.Attribute) and e.func.attr == "startswith"
+                and len(e.args) == 1 and other_vm(e.func.value, _str_const(e.args[0]))):
+            return False
+        if isinstance(e, ast.Compare) and len(e.ops) == 1:
+            left, right, op = e.left, e.comparators[0], e.ops[0]
+            if isinstance(op, (ast.In, ast.NotIn)) and platform_str(right) and _str_const(left) in ("java", "cli"):
+                return isinstance(op, ast.NotIn)
+            if isinstance(op, (ast.Eq, ast.NotEq)) and (
+                    other_vm(left, _str_const(right)) or other_vm(right, _str_const(left))):
+                return isinstance(op, ast.NotEq)
+        return None
+
+    def _mentions_other_vm(self, expr: ast.AST) -> bool:
+        return any(self._other_vm_test(n) is not None for n in ast.walk(expr))
+
     def eval_version(self, e: ast.AST, depth: int = 0) -> bool | None:
-        """Truth value of a version test on the target Python, or None if unknown."""
+        """Truth value of a version (or Jython/IronPython) test on the target CPython, or None if unknown."""
         if depth > 5:
             return None
+        other_vm = self._other_vm_test(e)
+        if other_vm is not None:
+            return other_vm
         if isinstance(e, ast.BoolOp):
             vals = [self.eval_version(v, depth + 1) for v in e.values]
             if isinstance(e.op, ast.And):
@@ -387,6 +432,8 @@ class Analyzer:
                 names = self._handler_names(parent)
                 if "ImportError" in names or "ModuleNotFoundError" in names:
                     return "fallback in except ImportError"
+                if "AttributeError" in names and self._probes_module(parent):
+                    return "fallback in except AttributeError"
             elif isinstance(parent, (ast.If, ast.IfExp, ast.While)) and field in ("body", "orelse"):
                 guard = self._branch_guard(parent.test, field == "body", words)
                 if guard:
@@ -397,16 +444,39 @@ class Analyzer:
                     r = self.eval_version(prev)
                     is_and = isinstance(parent.op, ast.And)
                     if r is not None and r != is_and:
-                        return f"version check (not run on {self.ctx.target[0]}.{self.ctx.target[1]})"
+                        return self._not_run(prev)
                     if r is None and (self._versionish(prev) or self._mentions(prev, words)):
                         return "version/feature check"
         return None
+
+    def _probes_module(self, handler: ast.ExceptHandler) -> bool:
+        """The try body of this handler uses an attribute of an imported module (feature detection).
+
+        ``try: asyncio.get_running_loop() except AttributeError: asyncio.get_event_loop()``: the
+        fallback only runs where the newer API is missing, i.e. on an older Python.
+        """
+        try_stmt = next((p for p, f, c in reversed(self.stack) if isinstance(p, _TRY) and c is handler), None)
+        if try_stmt is None:
+            return False
+        for stmt in try_stmt.body:
+            for n in ast.walk(stmt):
+                if isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load) and isinstance(
+                        n.value, (ast.Name, ast.Attribute)) and self.resolve(n.value):
+                    return True
+        return False
+
+    def _not_run(self, test: ast.AST) -> str:
+        names = {n.id for n in ast.walk(test) if isinstance(n, ast.Name)}
+        if self._mentions_other_vm(test) or any(
+                self._mentions_other_vm(self.version_names[n]) for n in names if n in self.version_names):
+            return "Jython/IronPython-only branch (not run on CPython)"
+        return f"version check (not run on {self.ctx.target[0]}.{self.ctx.target[1]})"
 
     def _branch_guard(self, test: ast.AST, in_body: bool, words: set[str]) -> str | None:
         r = self.eval_version(test)
         if r is not None:
             if r != in_body:
-                return f"version check (not run on {self.ctx.target[0]}.{self.ctx.target[1]})"
+                return self._not_run(test)
             return None
         if in_body and (self.resolves_to(test, _TYPE_CHECKING) or _call_name(test) in _TYPE_CHECKING):
             return "TYPE_CHECKING"
@@ -484,6 +554,8 @@ class Analyzer:
                 self.stack.append((node, field, value))
                 self.walk(value)
                 self.stack.pop()
+        if isinstance(node, ast.Assign):
+            self.leave_assign(node)
 
     def visit(self, node: ast.AST) -> None:
         if isinstance(node, ast.Import):
@@ -500,8 +572,6 @@ class Analyzer:
             self.visit_class(node)
         elif isinstance(node, (ast.With, ast.AsyncWith)):
             self.visit_with(node)
-        elif isinstance(node, ast.Assign):
-            self.visit_assign(node)
 
     # imports
 
@@ -564,18 +634,74 @@ class Analyzer:
             return
         receiver = self.resolve(node.value)
         if receiver:
-            if not any(r == o or r.startswith(o + ".") for r in receiver for o in e.owners):
+            if not any(self._owned(r, e) for r in receiver):
                 return
+        elif e.receiver_hint and not self._plausible_receiver(node.value, e):
+            return  # mypyc's builder.load_module(), winappdbg's mbi.is_reserved()
         cls = self.enclosing_class()
-        if isinstance(node.value, ast.Name) and node.value.id in ("self", "cls"):
-            if cls is not None and node.attr in self.class_methods.get(cls.name, ()):
-                return
+        if cls is not None and self._own_method(node.value, cls, node.attr):
+            return
         guard = None
         if cls is not None and any(
                 isinstance(n, ast.Call) and _call_name(n.func) in ("hasattr", "getattr")
                 and any(_str_const(a) == node.attr for a in n.args) for n in ast.walk(cls)):
             guard = f"hasattr(..., {node.attr!r}) check in class {cls.name}"
         self.report(e, node, f"{_call_name(node.value) or '(...)'}.{node.attr}", guard=guard)
+
+    def _own_method(self, recv: ast.AST, cls: ast.ClassDef, attr: str) -> bool:
+        """self.attr / super().attr refers to a method defined in this file, not the stdlib one."""
+        if isinstance(recv, ast.Name) and recv.id in ("self", "cls"):
+            return self._class_has(cls.name, attr)
+        if isinstance(recv, ast.Call) and isinstance(recv.func, ast.Name) and recv.func.id == "super":
+            # ansible: super().load_module() where the base class in this file defines load_module
+            return any(isinstance(b, ast.Name) and self._class_has(b.id, attr) for b in cls.bases)
+        return False
+
+    @staticmethod
+    def _owned(name: str, e: Entry) -> bool:
+        return any(name == o or name.startswith(o + ".") for o in e.owners)
+
+    def _plausible_receiver(self, expr: ast.AST, e: Entry, depth: int = 0) -> bool:
+        """An unresolved receiver looks like an object of the owner module.
+
+        True when a name or attribute in the receiver chain matches the entry's receiver_hint
+        (``loader.load_module()``, ``spec.loader.load_module()``, ``path.is_reserved()``), a call in
+        the chain resolves into the owner modules (``SourceFileLoader(...).load_module()``,
+        ``Path(p).is_reserved()``), the receiver is a local name assigned from such an expression,
+        or it starts at self, cls or super() in a class that looks like one.
+        """
+        hint = re.compile(e.receiver_hint)
+        x = expr
+        while True:
+            if isinstance(x, ast.Call):
+                if any(self._owned(q, e) for q in self.resolve(x.func)):
+                    return True
+                x = x.func
+            elif isinstance(x, ast.Attribute):
+                if hint.search(x.attr):
+                    return True
+                x = x.value
+            elif isinstance(x, ast.Subscript):
+                x = x.value
+            else:
+                break
+        if not isinstance(x, ast.Name):
+            return False
+        if hint.search(x.id) or any(self._owned(q, e) for q in self.resolve(x)):
+            return True
+        if x.id in ("self", "cls", "super"):  # self.loader.load_module(), super().load_module()
+            cls = self.enclosing_class()
+            if cls is None:
+                return False
+            names = [cls.name] + [n for b in cls.bases for n in (self.resolve(b) or {_call_name(b) or ""})]
+            return any(hint.search(n.split(".")[-1]) or self._owned(n, e) for n in names)
+        if x is expr and depth < 2:
+            scope = self.in_function() or self.tree
+            for n in ast.walk(scope):
+                if (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == x.id for t in n.targets)
+                        and self._plausible_receiver(n.value, e, depth + 1)):
+                    return True
+        return False
 
     # calls
 
@@ -710,16 +836,27 @@ class Analyzer:
             if isinstance(ce, ast.Call) and self.resolves_to(ce.func, _PATHLIB_CLASSES):
                 self.report(c, ce, f"with {_call_name(ce.func)}(...)")
 
-    def visit_assign(self, node: ast.Assign) -> None:
+    def leave_assign(self, node: ast.Assign) -> None:
+        """Track names bound to argparse groups, after the right-hand side has been checked.
+
+        In ``grp = grp.add_mutually_exclusive_group()`` the receiver is still the old group.
+        """
         if "argparse_nested_groups" not in self.checks:
             return
         value = node.value
-        if (len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and isinstance(value, ast.Call)
-                and isinstance(value.func, ast.Attribute)
+        names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        if not names:
+            return
+        scope = self.group_vars.setdefault(id(self.in_function() or self.tree), {})
+        kind = None
+        if (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
                 and value.func.attr in ("add_argument_group", "add_mutually_exclusive_group")):
-            scope = id(self.in_function() or self.tree)
             kind = "group" if value.func.attr == "add_argument_group" else "mutex"
-            self.group_vars.setdefault(scope, {})[node.targets[0].id] = kind
+        for name in names:
+            if kind:
+                scope[name] = kind
+            else:
+                scope.pop(name, None)  # rebound to something else
 
     # checks on calls
 
@@ -762,13 +899,21 @@ class Analyzer:
             self.report(e, node, "asyncio.get_event_loop()")
 
     def check_getuser(self, e: Entry, node: ast.Call) -> None:
-        for parent, field, _child in reversed(self.stack):
-            if isinstance(parent, _TRY) and field == "body":
-                names = [n for h in parent.handlers for n in self._handler_names(h)]
-                old = [n for n in names if n in ("KeyError", "ImportError")]
-                if old and not self._catches(names, "OSError"):
-                    self.report(e, node, f"getpass.getuser() in try/except {'/'.join(old)}")
-                return
+        try_stmt = next((p for p, f, _c in reversed(self.stack) if isinstance(p, _TRY) and f == "body"), None)
+        frames = {(id(p), f) for p, f, _c in self.stack}
+        # An earlier unguarded getuser() in an enclosing block (ansible's user facts) has already
+        # raised if getuser() fails, so a later except clause is about something else.
+        earlier = next((line for block, line in self.getuser_unguarded if block in frames), None)
+        if try_stmt is None:
+            block = next(((id(p), f) for p, f, c in reversed(self.stack) if isinstance(c, ast.stmt)), None)
+            if block is not None:
+                self.getuser_unguarded.append((block, node.lineno))
+            return
+        names = [n for h in try_stmt.handlers for n in self._handler_names(h)]
+        old = [n for n in names if n in ("KeyError", "ImportError")]
+        if old and not self._catches(names, "OSError"):
+            guard = f"getpass.getuser() already called unguarded on line {earlier}" if earlier else None
+            self.report(e, node, f"getpass.getuser() in try/except {'/'.join(old)}", guard=guard)
 
     def check_typeddict(self, e: Entry, node: ast.Call) -> None:
         if any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords):

@@ -37,6 +37,7 @@ class Entry:
     targets: tuple[str, ...] = ()
     check: str = ""
     owners: tuple[str, ...] = ()
+    receiver_hint: str = ""  # regex; an unresolved receiver must look like the owner's object
     called: bool = False
     min_args: int = 0
     max_args: int | None = None

@@ -537,3 +537,222 @@ def test_coding_cookie_bytes():
     src = "# -*- coding: latin-1 -*-\nimport cgi\nx = '\xe9'\n".encode("latin-1")
     found = analyze_source(src, entries, FileContext(target=(3, 15)))
     assert [f.api for f in found] == ["cgi"]
+
+
+# --- false positives found on a 360-distribution scan (0.2.0) --------------------
+
+def test_jython_branch_is_not_run_on_cpython():
+    # appdirs (vendored by numba and seaborn): platform.java_ver() only under sys.platform 'java'
+    code = """
+        import sys
+        if sys.platform.startswith('java'):
+            import platform
+            os_name = platform.java_ver()[3][0]
+        else:
+            system = sys.platform
+    """
+    assert one(code).guard == "Jython/IronPython-only branch (not run on CPython)"
+
+
+@pytest.mark.parametrize("test", [
+    "sys.platform.startswith('java')",
+    "sys.platform[:4] == 'java'",
+    "'java' in sys.platform",
+    "sys.platform == 'cli'",
+    "os.name == 'java'",
+    "platform.system() == 'Java'",
+    "platform.python_implementation() == 'Jython'",
+    "IS_JYTHON",
+    "sys.platform.startswith('java') or sys.platform == 'cli'",
+])
+def test_other_vm_tests(test):
+    code = f"""
+        import os, sys, platform
+        IS_JYTHON = sys.platform.startswith('java')
+        if {test}:
+            platform.java_ver()
+    """
+    assert one(code).guard == "Jython/IronPython-only branch (not run on CPython)"
+
+
+def test_cpython_branch_of_jython_check_is_reported():
+    code = """
+        import sys, platform
+        if not sys.platform.startswith('java'):
+            platform.java_ver()
+        if sys.platform.startswith('linux'):
+            platform.java_ver()
+    """
+    assert [f.guard for f in scan(code)] == [None, None]
+
+
+def test_regrouped_mutex_group_is_not_nested():
+    # you-get: grp = grp.add_mutually_exclusive_group() reads the old (plain) group
+    code = """
+        import argparse
+        def main():
+            parser = argparse.ArgumentParser()
+            grp = parser.add_argument_group('Dry-run options')
+            grp = grp.add_mutually_exclusive_group()
+            grp.add_argument('-i', '--info')
+            grp.add_argument('-u', '--url')
+            grp = grp.add_argument_group('nested')
+    """
+    assert rules(code) == [("py314-argparse-nested-groups", 9)]
+
+
+def test_rebound_group_name_is_forgotten():
+    code = """
+        def main(parser):
+            g = parser.add_mutually_exclusive_group()
+            g = parser
+            g.add_argument_group('fine')
+    """
+    assert not scan(code)
+
+
+def test_fallback_in_except_attributeerror():
+    # dnspython: get_running_loop() first, get_event_loop() only where it does not exist
+    code = """
+        import asyncio
+        def _get_running_loop():
+            try:
+                return asyncio.get_running_loop()
+            except AttributeError:
+                return asyncio.get_event_loop()
+    """
+    assert one(code).guard == "fallback in except AttributeError"
+
+
+def test_except_attributeerror_without_module_probe_is_not_a_guard():
+    code = """
+        import asyncio
+        def f(obj):
+            try:
+                return obj.loop
+            except AttributeError:
+                return asyncio.get_event_loop()
+    """
+    assert one(code).guard is None
+
+
+def test_getpass_getuser_already_called_unguarded():
+    # ansible user facts: getuser() runs unguarded first; the except KeyError is for pwd.getpwnam()
+    code = """
+        import getpass, os, pwd
+        def collect():
+            facts = {'user_id': getpass.getuser()}
+            try:
+                pwent = pwd.getpwnam(getpass.getuser())
+            except KeyError:
+                pwent = pwd.getpwuid(os.getuid())
+            return facts, pwent
+    """
+    assert one(code).guard == "getpass.getuser() already called unguarded on line 4"
+
+
+def test_getpass_getuser_unguarded_call_in_other_branch_does_not_count():
+    code = """
+        import getpass
+        def f(flag):
+            if flag:
+                print(getpass.getuser())
+            try:
+                return getpass.getuser()
+            except KeyError:
+                return None
+    """
+    assert one(code).guard is None
+
+
+def test_getpass_getuser_module_level():
+    # wandb cli.py
+    code = """
+        import getpass
+        try:
+            _username = getpass.getuser()
+        except KeyError:
+            _username = str(os.getuid())
+    """
+    f = one(code)
+    assert f.rule == "py313-getpass-getuser" and f.guard is None and f.severity == "behavior"
+
+
+def test_load_module_on_non_loader_not_flagged():
+    # mypyc irbuild: IRBuilder.load_module(name) is mypyc's own method, reached through `builder`
+    code = """
+        def transform_name_expr(builder, expr):
+            return builder.load_module(expr.node.fullname)
+        class Wrapper:
+            def load(self, name):
+                return self.builder.load_module(name)
+    """
+    assert not scan(code)
+
+
+@pytest.mark.parametrize("code", [
+    "def f(loader, name):\n    return loader.load_module(name)",
+    "def f(spec, name):\n    return spec.loader.load_module(name)",
+    "def f(importer, name):\n    return importer.find_module(name).load_module(name)",
+    "import pkgutil\ndef f(name):\n    return pkgutil.get_importer('.').load_module(name)",
+    "from importlib.machinery import SourceFileLoader\ndef f():\n    return SourceFileLoader('m', 'p').load_module()",
+    "from importlib.machinery import SourceFileLoader\ndef f():\n    x = SourceFileLoader('m', 'p')\n    return x.load_module()",
+    "import zipimport\ndef f(p):\n    z = zipimport.zipimporter(p)\n    return z.load_module('m')",
+    "import importlib.abc\nclass L(importlib.abc.Loader):\n    def exec_module(self, m): pass\n    def go(self):\n        return self.load_module('m')",
+])
+def test_load_module_on_plausible_loader(code):
+    assert [f.rule for f in scan(code)] == ["py315-load-module-call"], code
+
+
+def test_super_load_module():
+    # ansible collection loader: the base class in the same file defines load_module()
+    code = """
+        class _PkgLoaderBase:
+            def exec_module(self, module): pass
+            def load_module(self, fullname): pass
+        class _PkgLoader(_PkgLoaderBase):
+            def load_module(self, fullname):
+                module = super(_PkgLoader, self).load_module(fullname)
+                return module
+    """
+    assert not scan(code)
+    code = """
+        import importlib.machinery
+        class Loader(importlib.machinery.SourceFileLoader):
+            def load_module(self, fullname):
+                return super().load_module(fullname)
+    """
+    assert ("py315-load-module-call", 5) in rules(code)
+
+
+def test_wrapped_loader_attribute_in_loader_class():
+    # wrapt importer: self.__wrapped__ is the wrapped loader
+    code = """
+        class _ChainedLoader:
+            def exec_module(self, m): pass
+            def _load(self, fullname):
+                return self.__wrapped__.load_module(fullname)
+    """
+    assert rules(code) == [("py315-load-module-call", 5)]
+
+
+def test_is_reserved_on_non_path_not_flagged():
+    # winappdbg process.py: MemoryBasicInformation.is_reserved()
+    code = """
+        def is_address_reserved(self, address):
+            mbi = self.mquery(address)
+            return mbi.is_reserved()
+        def walk(old_mbi, new_mbi):
+            return old_mbi.is_reserved() or new_mbi.is_reserved()
+    """
+    assert not scan(code)
+
+
+@pytest.mark.parametrize("code", [
+    "def f(path):\n    return path.is_reserved()",
+    "def f(self):\n    return self.file_path.is_reserved()",
+    "from pathlib import PureWindowsPath\ndef f(n):\n    return PureWindowsPath(n).is_reserved()",
+    "import pathlib\ndef f(n):\n    return pathlib.Path(n).parent.is_reserved()",
+])
+def test_is_reserved_on_plausible_path(code):
+    assert [f.rule for f in scan(code)] == ["py315-purepath-is-reserved"], code
