@@ -90,6 +90,21 @@ annotation (anyio), `visit_Num` on a non-`ast` visitor (sympy's LFortran visitor
 `find_module()` (dead since 3.12, not a 3.15 change), and a `functools.partial` class attribute
 used only as a decorator (matplotlib).
 
+0.2.0 fixes the false positives of a larger scan of about 360 distributions (see the
+[changelog](CHANGELOG.md)) and was checked on a second venv: 46 popular packages on Python
+3.13.14, 222 distributions, 17,400 files. 0.1.0 reported 3 import-time, 12 call-time and 15
+behaviour findings there; 0.2.0 reports 0, 5 and 13 (34 guarded). The 12 that went away are all
+false positives: `platform.java_ver()` under `sys.platform.startswith("java")` (appdirs, and its
+copies in numba and seaborn), mypyc's `builder.load_module()` (4), ansible's
+`super().load_module()` whose base class defines `load_module()`, ansible's second
+`getpass.getuser()` call, you-get's `grp = grp.add_mutually_exclusive_group()` (2), and
+dnspython's `except AttributeError:` fallback. No finding was added. The run also found three
+more true positives: fabric's `get_local_user()` catches only `KeyError`/`ImportError` around
+`getpass.getuser()` (on 3.13+ it raises `OSError`, which escapes into `Config`), pyzmq's
+`_AsyncIO._default_loop()` falls back to `asyncio.get_event_loop()` with no running loop, and
+pip passes `check_home=True` to `sysconfig.is_python_build()` (removed in 3.15) in a code path
+that only runs when a distributor turns sysconfig off.
+
 ## Usage
 
 ```
@@ -109,9 +124,25 @@ stdlib-radar src tests            # only these source trees
 | `--dist NAME` | only report these distributions |
 | `--include-tests` / `--exclude-tests` | test files are skipped in site-packages and scanned in source trees by default |
 | `--show-guarded` | also list hits behind a guard (see below) |
-| `--format text\|markdown\|json`, `--json` | output format |
+| `--format text\|markdown\|json\|leads`, `--json` | output format; `leads` is described below |
 | `--fail-on import\|call\|behavior\|never` | exit 1 when an unguarded finding is this severe (default `call`) |
 | `--list-rules` | print the rule table |
+
+`--format leads` prints only the unguarded findings, grouped by distribution, with each
+project's URL from its metadata (the source repository when the metadata lists one), as
+Markdown. Use it as a starting list for upstream bug reports or pull requests, after checking
+each finding against the project's default branch:
+
+```
+## tornado 6.6
+
+<https://github.com/tornadoweb/tornado>
+
+- pkgutil.get_loader() and pkgutil.find_loader() removed (3.14, py314-pkgutil-loaders)
+  - CALL `tornado/autoreload.py:339` `pkgutil.get_loader`
+  - fix: importlib.util.find_spec(name) and spec.loader
+  - docs: https://docs.python.org/3.14/whatsnew/3.14.html#pkgutil
+```
 
 In CI:
 
@@ -155,7 +186,10 @@ example pickling `itertools` iterators or `EntryPoint[0]`.
 
 Findings found by method name alone (for example `.is_reserved()` or `.load_module()` on an
 object of unknown type, with a call that fits the stdlib signature) are marked
-`medium confidence`.
+`medium confidence`. For `load_module()` and `is_reserved()` the receiver must also look like a
+loader or a path: a name such as `loader`, `spec.loader`, `importer` or `path`, a call into
+`importlib`, `zipimport` or `pathlib` (`SourceFileLoader(...)`, `Path(p)`), a local variable
+assigned from one, or `self` in a loader class.
 
 ### Guards
 
@@ -166,10 +200,15 @@ A hit is reported as guarded, and hidden unless `--show-guarded`, when it sits
 - in a branch that does not run on the target: `sys.version_info`, `sys.hexversion`,
   `six.PY2`, `PY2`, and module-level flags such as `PY313 = sys.version_info >= (3, 13)` are
   evaluated for the target version; version checks it cannot evaluate also count as a guard
+- in a branch that only runs on Jython or IronPython: `sys.platform.startswith("java")`,
+  `os.name == "java"`, `sys.platform == "cli"`, `platform.python_implementation() == "Jython"`,
+  ...
 - behind `hasattr(mod, "name")`, `find_spec("name")` or `if TYPE_CHECKING:`, in an
   `if hasattr(...)`/`elif`/`else` feature-detection chain, or in a class that checks
   `hasattr(obj, "method")` before using the method
-- in an `except ImportError:` block (fallback code)
+- in an `except ImportError:` block (fallback code), or in an `except AttributeError:` block
+  whose `try` uses an attribute of an imported module (`try: asyncio.get_running_loop()
+  except AttributeError: asyncio.get_event_loop()`)
 - in an annotation, which 3.14+ evaluates only when something introspects it (annotations of
   local variables, and all annotations under `from __future__ import annotations`, are never
   evaluated and are not reported)
