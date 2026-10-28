@@ -1,19 +1,21 @@
 import json
 import sys
 import textwrap
+from email.message import Message
 
 import pytest
 
 from stdlib_radar.cli import main
-from stdlib_radar.sources import is_test_path
+from stdlib_radar.sources import is_test_path, project_url
 
 
-def make_dist(site, name, version, files, requires=()):
+def make_dist(site, name, version, files, requires=(), meta_extra=()):
     """Write a minimal installed distribution (METADATA + RECORD) into a fake site-packages."""
     info = site / f"{name}-{version}.dist-info"
     info.mkdir(parents=True)
     meta = [f"Metadata-Version: 2.1", f"Name: {name}", f"Version: {version}"]
     meta += [f"Requires-Dist: {r}" for r in requires]
+    meta += list(meta_extra)
     (info / "METADATA").write_text("\n".join(meta) + "\n", encoding="utf-8")
     record = []
     for rel, text in files.items():
@@ -34,7 +36,8 @@ def site(tmp_path):
         "oldlib/__init__.py": "import imghdr\n",
         "oldlib/util.py": "def f():\n    import ast\n    return ast.Num\n",
         "oldlib/tests/test_x.py": "import cgi\n",
-    })
+    }, meta_extra=["Project-URL: Documentation, https://oldlib.readthedocs.io",
+                   "Project-URL: Issues, https://github.com/example/oldlib/issues"])
     make_dist(site, "careful", "2.0", {
         "careful/__init__.py": "try:\n    import cgi\nexcept ImportError:\n    cgi = None\n",
     })
@@ -172,3 +175,47 @@ def test_parallel_matches_serial(tmp_path, capsys):
 ])
 def test_is_test_path(rel, expected):
     assert is_test_path(rel) is expected
+
+
+def test_leads_format(site, capsys):
+    code, out = run(capsys, "--venv", site, "--format", "leads", "-j", "1")
+    assert code == 1
+    assert out.startswith("# stdlib-radar leads\n\nChanges after Python 3.12 up to 3.15; ")
+    assert "(Python 3.11.9, " in out
+    assert "## oldlib 1.0\n\n<https://github.com/example/oldlib>\n" in out
+    assert "  - IMPORT `oldlib/__init__.py:1` `imghdr`" in out
+    assert "  - CALL `oldlib/util.py:3` `ast.Num`" in out
+    assert "## loose (in site-packages, no RECORD)\n\n(no RECORD, owner unknown)" in out
+    assert "careful" not in out and "backported" not in out  # guarded hits are never leads
+    _code, out = run(capsys, "--venv", site, "--format", "leads", "--show-guarded", "-j", "1")
+    assert "careful" not in out
+    assert out.rstrip().endswith("3 findings in 2 groups.")
+
+
+def test_json_has_project_url(site, capsys):
+    _code, out = run(capsys, "--venv", site, "--json", "-j", "1")
+    urls = {g["name"]: g["url"] for g in json.loads(out)["groups"]}
+    assert urls == {"oldlib": "https://github.com/example/oldlib", "loose": ""}
+
+
+def _meta(*lines):
+    m = Message()
+    for line in lines:
+        key, _, value = line.partition(": ")
+        m[key] = value
+    return m
+
+
+@pytest.mark.parametrize("lines,url", [
+    (["Project-URL: Documentation, https://docs.example.org",
+      "Project-URL: Source, https://github.com/org/proj.git"], "https://github.com/org/proj"),
+    (["Home-page: https://example.org", "Project-URL: Changelog, https://gitlab.com/g/p/-/blob/main/CHANGES"],
+     "https://gitlab.com/g/p"),
+    (["Home-page: https://www.example.org/proj"], "https://www.example.org/proj"),
+    (["Project-URL: Homepage, https://example.org", "Project-URL: Funding, https://example.org/donate"],
+     "https://example.org"),
+    (["Home-page: UNKNOWN"], ""),
+    ([], ""),
+])
+def test_project_url(lines, url):
+    assert project_url(_meta(*lines)) == url

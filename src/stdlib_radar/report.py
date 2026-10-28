@@ -19,6 +19,7 @@ class Group:
     version: str = ""
     root: str = ""
     findings: list = field(default_factory=list)
+    url: str = ""
 
     def visible(self, show_guarded: bool) -> list:
         return [f for f in self.findings if show_guarded or not f.guard]
@@ -92,6 +93,12 @@ def _header(report: Report) -> str:
     return line
 
 
+def _sentence(report: Report) -> str:
+    """The header without the tool name, as a sentence ("Changes after Python 3.12 ...")."""
+    text = _header(report).split(": ", 1)[1]
+    return text[:1].upper() + text[1:] + "."
+
+
 def _summary(report: Report, show_guarded: bool) -> str:
     t = report.totals()
     hit_groups = sum(1 for g in report.groups if g.visible(False))
@@ -134,7 +141,7 @@ def _md(text: str) -> str:
 
 
 def render_markdown(report: Report, show_guarded: bool = False) -> str:
-    out = ["# stdlib-radar report", "", _header(report).split(": ", 1)[1].capitalize() + ".", ""]
+    out = ["# stdlib-radar report", "", _sentence(report), ""]
     groups = _sorted_groups(report, show_guarded)
     if groups:
         out += ["| Group | Import-time | Call-time | Behaviour | Guarded |", "|---|---:|---:|---:|---:|"]
@@ -174,6 +181,7 @@ def render_json(report: Report, show_guarded: bool = False) -> str:
                 "kind": g.kind,
                 "version": g.version,
                 "root": g.root,
+                "url": g.url,
                 "counts": g.counts(),
                 "findings": [f.to_dict() for f in g.visible(show_guarded)],
             }
@@ -181,6 +189,37 @@ def render_json(report: Report, show_guarded: bool = False) -> str:
         ],
     }
     return json.dumps(data, indent=2) + "\n"
+
+
+def render_leads(report: Report, show_guarded: bool = False) -> str:
+    """Unguarded findings grouped by distribution with each project's URL, for upstream reports.
+
+    Guarded hits are never listed here, whatever --show-guarded says.
+    """
+    groups = _sorted_groups(report, False)
+    out = ["# stdlib-radar leads", "", _sentence(report),
+           "Unguarded findings only. Check each one against the project's default branch before reporting it.", ""]
+    total = 0
+    for g in groups:
+        vis = g.visible(False)
+        total += len(vis)
+        if g.kind == "distribution":
+            where = g.url or "no project URL in its metadata"
+        else:
+            where = "source tree" if g.kind == "source" else "no RECORD, owner unknown"
+        out += [f"## {g.title}", "", f"<{where}>" if g.url else f"({where})", ""]
+        for _rule, fs in _by_rule(vis):
+            f0 = fs[0]
+            out.append(f"- {f0.message} ({f0.removed_in}, {f0.rule})")
+            for f in fs:
+                conf = "" if f.confidence == "high" else f", {f.confidence} confidence"
+                out.append(f"  - {SEVERITY_LABEL[f.severity]} `{f.path}:{f.line}` `{f.api}`{conf}")
+            out.append(f"  - fix: {f0.fix}")
+            out.append(f"  - docs: {f0.doc}")
+        out.append("")
+    n = len(groups)
+    out.append(f"{total} finding{'s' if total != 1 else ''} in {n} group{'s' if n != 1 else ''}.")
+    return "\n".join(out) + "\n"
 
 
 def failing(report: Report, fail_on: str) -> list[Finding]:

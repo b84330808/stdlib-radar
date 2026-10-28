@@ -28,6 +28,7 @@ class Unit:
     version: str = ""
     files: list = field(default_factory=list)
     requirements: frozenset = frozenset()
+    url: str = ""  # project URL from the distribution's metadata (source repository if listed)
 
 
 @dataclass
@@ -89,6 +90,38 @@ def site_dirs_for_python(python: str) -> tuple[list, str]:
     return dirs, info["version"]
 
 
+_FORGES = ("github.com", "gitlab.com", "bitbucket.org", "codeberg.org", "git.sr.ht", "foss.heptapod.net")
+_SOURCE_LABELS = {"source", "sourcecode", "repository", "repo", "code", "github", "gitlab", "git", "homepage",
+                  "home", "sources", "vcs"}
+
+
+def project_url(meta) -> str:
+    """Best guess at the project's source repository from core metadata, else its home page.
+
+    Forge links (GitHub, GitLab, ...) are trimmed to the repository root, so an "Issues" or
+    "Changelog" link still gives the repository.
+    """
+    candidates = []
+    for item in meta.get_all("Project-URL") or ():
+        label, _, url = item.partition(",")
+        candidates.append((re.sub(r"[^a-z]", "", label.lower()), url.strip()))
+    home = meta.get("Home-page")
+    if home and home.strip().upper() != "UNKNOWN":
+        candidates.append(("homepage", home.strip()))
+    best, best_rank = "", 99
+    for label, url in candidates:
+        if not url.startswith(("http://", "https://")):
+            continue
+        m = re.match(r"https?://(?:www\.)?([^/]+)/([^/#?]+)/([^/#?]+)", url)
+        forge = m and m.group(1).lower() in _FORGES
+        if forge:
+            url = f"https://{m.group(1).lower()}/{m.group(2)}/{m.group(3).removesuffix('.git')}"
+        rank = (0 if label in _SOURCE_LABELS else 1) if forge else (2 if label in _SOURCE_LABELS else 3)
+        if rank < best_rank:
+            best, best_rank = url, rank
+    return best
+
+
 def _requirement_names(dist) -> frozenset:
     names = set()
     for req in dist.requires or ():
@@ -135,7 +168,7 @@ def load_environment(site_dirs: list, python: str = "") -> Environment:
         for dist in metadata.distributions(path=[str(sp)]):
             name = dist.metadata["Name"] or "?"
             unit = Unit(name=name, kind="distribution", root=Path(sp), version=dist.version or "",
-                        requirements=_requirement_names(dist))
+                        requirements=_requirement_names(dist), url=project_url(dist.metadata))
             env.units.append(unit)
             for f in dist.files or ():
                 path = Path(str(dist.locate_file(f)))

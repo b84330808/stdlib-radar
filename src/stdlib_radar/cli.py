@@ -11,7 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from . import __version__
-from .report import Group, Report, failing, render_json, render_markdown, render_text
+from .report import Group, Report, failing, render_json, render_leads, render_markdown, render_text
 from .rules import CONFIDENCES, known_versions, load_entries, parse_version, select_entries
 from .scanner import FileContext, ParseError, analyze_source
 from .sources import (
@@ -32,6 +32,7 @@ examples:
   stdlib-radar src --since 3.13     only changes made in 3.14 and 3.15
   stdlib-radar --encoding           also flag text I/O without encoding= (PEP 686, 3.15)
   stdlib-radar --format markdown > report.md
+  stdlib-radar --venv .venv --format leads   findings per distribution with project URLs
 
 exit status: 0 nothing at or above --fail-on, 1 findings, 2 usage error.
 """
@@ -68,7 +69,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="skip test files in source trees too")
     p.add_argument("--show-guarded", action="store_true",
                    help="also list hits behind try/except, version checks, hasattr() or installed backports")
-    p.add_argument("--format", choices=("text", "markdown", "json"), default="text")
+    p.add_argument("--format", choices=("text", "markdown", "json", "leads"), default="text",
+                   help="leads: unguarded findings grouped by distribution with each project's URL (Markdown)")
     p.add_argument("--json", action="store_const", const="json", dest="format", help="same as --format json")
     p.add_argument("--fail-on", choices=("import", "call", "behavior", "never"), default="call",
                    help="exit 1 if an unguarded finding is this severe (default call: import- or call-time)")
@@ -219,7 +221,7 @@ def main(argv=None) -> int:
     jobs = args.jobs or os.cpu_count() or 1
     results = _run_tasks(tasks, entries, target, env.provided_modules if env else {}, jobs)
 
-    groups = [Group(name=u.name, kind=u.kind, version=u.version, root=str(u.root)) for u in units]
+    groups = [Group(name=u.name, kind=u.kind, version=u.version, root=str(u.root), url=u.url) for u in units]
     unparsable = []
     for (ui, fi), findings, error in results:
         path = units[ui].files[fi]
@@ -246,7 +248,8 @@ def main(argv=None) -> int:
         sources=sum(1 for u in units if u.kind == "source"),
         options={"verbose": args.verbose},
     )
-    render = {"text": render_text, "markdown": render_markdown, "json": render_json}[args.format]
+    render = {"text": render_text, "markdown": render_markdown, "json": render_json,
+              "leads": render_leads}[args.format]
     sys.stdout.write(render(report, show_guarded=args.show_guarded))
     return 1 if failing(report, args.fail_on) else 0
 
